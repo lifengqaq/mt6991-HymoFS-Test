@@ -1,4 +1,4 @@
-Name: (测试) HymoFS构建 6.6.89 欧加真OKI内核
+name: (测试) HymoFS构建 6.6.89 欧加真OKI内核
 
 env:
   TZ: Asia/Shanghai
