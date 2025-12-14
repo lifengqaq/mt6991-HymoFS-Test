@@ -1,4 +1,4 @@
-name: (测试) HymoFS构建 6.6.89 欧加真OKI内核
+name: HymoFS构建 6.6.89 欧加真OKI内核 v1.0
 
 env:
   TZ: Asia/Shanghai
@@ -9,16 +9,22 @@ env:
 on:
   workflow_dispatch:
     inputs:
+      version:
+        description: '发布版本号 (e.g., 1.0, 1.1, etc.)'
+        required: true
+        type: string
+        default: '1.0' # 已改为 v1.0
       ccache_debug:
         description: '是否上传 Ccache调试日志'
         required: true
         type: boolean
         default: 'false'
       kernel_suffix:
-        description: '内核后缀(可选，用于区分版本)'
+        # 已移除默认值，仅供用户覆盖原始名称时使用
+        description: '内核后缀(可选，留空则默认使用源码自带版本号)'
         required: false
         type: string
-        default: 'HymoFS_Test'
+        default: ''
 
 jobs:
   build:
@@ -73,9 +79,10 @@ jobs:
         id: ccache-restore
         with:
           path: ${{ env.CCACHE_DIR }}
-          key: ccache-neov4-mtk_6.6.89-${{ runner.os }}-hymofs
+          # 缓存键名更新为基于版本号
+          key: ccache-neov4-mtk_6.6.89-${{ runner.os }}-hymofs-v${{ github.event.inputs.version }}
           restore-keys: |
-            ccache-neov4-mtk_6.6.89-${{ runner.os }}-
+            ccache-neov4-mtk_6.6.89-${{ runner.os }}-hymofs-
 
       - name: 初始化并配置ccache
         run: |
@@ -90,19 +97,15 @@ jobs:
           ccache -o compression=true
           ccache -s
 
-      # --- 核心修改：应用 HymoFS 补丁 ---
       - name: 应用 HymoFS 补丁
         run: |
           echo "正在下载并应用 HymoFS 补丁..."
           cd kernel_workspace/common
           
-          # 下载独立版 HymoFS 补丁 (不含 SUSFS)
           wget https://raw.githubusercontent.com/Anatdx/HymoFS/refs/heads/main/patch/hymofs.patch
           
-          # 应用补丁
           patch -p1 -F 3 < hymofs.patch || { echo "HymoFS 补丁应用失败"; exit 1; }
           
-          # 写入配置文件
           echo "CONFIG_HYMOFS=y" >> ./arch/arm64/configs/gki_defconfig
           
           echo "HymoFS 补丁应用完成，配置已写入 gki_defconfig。"
@@ -110,30 +113,34 @@ jobs:
       - name: 配置其他基础构建项
         run: |
           cd kernel_workspace
-          # 开启O2编译优化配置 (保持原有优化)
           echo "CONFIG_CC_OPTIMIZE_FOR_PERFORMANCE=y" >> ./common/arch/arm64/configs/gki_defconfig
-          # 禁用 defconfig 检查
           sed -i 's/check_defconfig//' ./common/build.config.gki
-          # 跳过不必要的头文件安装
           echo "CONFIG_HEADERS_INSTALL=n" >> ./common/arch/arm64/configs/gki_defconfig
 
       - name: 添加制作名称
         run: |
           cd kernel_workspace
           echo "替换内核版本后缀..."
+          # 如果用户提供了后缀，则使用用户后缀
           if [[ -n "${{ github.event.inputs.kernel_suffix }}" ]]; then
             SUFFIX="${{ github.event.inputs.kernel_suffix }}"
+            echo "当前内核版本后缀：$SUFFIX (用户自定义)"
+          # 否则，使用原始 KERNEL_NAME
           else
-            SUFFIX="HymoFS"
+            SUFFIX="${{ env.KERNEL_NAME }}"
+            echo "当前内核版本后缀：$SUFFIX (默认)"
           fi
           
+          # 应用后缀到 setlocalversion 脚本
           for f in ./common/scripts/setlocalversion; do
             sed -i "\$s|echo \"\\\$res\"|echo \"-$SUFFIX\"|" "$f"
           done
-          # 替换 defconfig 中的名称标识
+          # 应用后缀到 defconfig 文件（替换原始 -4k）
           sudo sed -i "s/-4k/-$SUFFIX/g" ./common/arch/arm64/configs/gki_defconfig
+          
           sed -i 's/${scm_version}//' ./common/scripts/setlocalversion
           echo "CONFIG_LOCALVERSION_AUTO=n" >> ./common/arch/arm64/configs/gki_defconfig
+          echo "KERNEL_BUILD_SUFFIX=$SUFFIX" >> $GITHUB_ENV # 存储到 env 供后续步骤使用
            
       - name: 构建内核
         run: |
@@ -151,7 +158,6 @@ jobs:
           
           cd kernel_workspace/common
           
-          # 使用 fakeroot/faketime 保持构建可复现性 (沿用原有逻辑)
           wget https://github.com/cctv18/oppo_oplus_realme_sm8750/raw/refs/heads/main/lib/libfakestat.so
           wget https://github.com/cctv18/oppo_oplus_realme_sm8750/raw/refs/heads/main/lib/libfaketimeMT.so
           chmod 777 ./*.so
@@ -160,7 +166,6 @@ jobs:
           SO_DIR=$(pwd)
           export PRELOAD_LIBS="$SO_DIR/libfakestat.so $SO_DIR/libfaketimeMT.so"
           
-          # 创建编译器包装器
           echo '#!/bin/bash' > cc-wrapper
           echo 'export LD_PRELOAD="'$PRELOAD_LIBS'"' >> cc-wrapper
           echo 'export FAKESTAT="'$FAKESTAT'"' >> cc-wrapper
@@ -175,16 +180,12 @@ jobs:
           
           chmod +x cc-wrapper ld-wrapper
           
-          # 清理不必要的环境以释放空间
           sudo rm -rf /usr/share/dotnet &
           sudo rm -rf /usr/local/lib/android &
           sudo rm -rf /opt/ghc &
           
-          # 开始编译
           make -j$(nproc --all) LLVM=1 ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- CC="ccache clang" LD="ld.lld" HOSTLD=ld.lld O=out KCFLAGS+=-O2 KCFLAGS+=-Wno-error gki_defconfig &&
           make -j$(nproc --all) LLVM=1 ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- CC="$(pwd)/cc-wrapper" LD="$(pwd)/ld-wrapper" HOSTLD=ld.lld O=out KCFLAGS+=-O2 KCFLAGS+=-Wno-error Image
-          
-          echo "内核编译完成！"
 
       - name: 克隆 AnyKernel3 并打包
         run: |
@@ -198,8 +199,8 @@ jobs:
             exit 1
           fi
           
-          # 打包命令
-          zip -r ../AnyKernel3_HymoFS_${{ env.KERNEL_VERSION }}_${{ github.event.inputs.kernel_suffix }}.zip ./*
+          # 打包文件名使用 HymoFS_vX.X 和 内核后缀
+          zip -r ../AnyKernel3_HymoFS_v${{ github.event.inputs.version }}_${{ env.KERNEL_VERSION }}_${{ env.KERNEL_BUILD_SUFFIX }}.zip ./*
 
       - name: 上传 Ccache 调试日志
         if: always() && inputs.ccache_debug
@@ -235,31 +236,33 @@ jobs:
           TIME_FORM="$(TZ='Asia/Shanghai' date +'%Y-%m-%d %H:%M:%S')"
           echo "TIME=$TIME" >> $GITHUB_ENV
           echo "TIME_FORM=$TIME_FORM" >> $GITHUB_ENV
-          echo "TAG_HEAD=HymoFS-Test-Build" >> $GITHUB_ENV
+          echo "FULL_VERSION=v${{ github.event.inputs.version }}" >> $GITHUB_ENV
+          echo "TAG_HEAD=HymoFS-Build" >> $GITHUB_ENV
          
       - name: 创建发布
         id: create_release
         uses: softprops/action-gh-release@v1
         with:
-          tag_name: "${{ env.TAG_HEAD }}-${{ env.TIME }}"
-          name: "HymoFS Test Build - ${{ env.TIME }}"
+          # Tag 命名为 HymoFS-Build-v1.0-时间戳
+          tag_name: "${{ env.TAG_HEAD }}-${{ env.FULL_VERSION }}-${{ env.TIME }}"
+          # Release 名称为 HymoFS Build v1.0
+          name: "HymoFS Build ${{ env.FULL_VERSION }}"
           body: |
-            ### 🧪 HymoFS 测试构建 | Build Info
-            - 编译时间: ${{ env.TIME_FORM }}
-            - 内核源码：OnePlus Ace 5 Ultra 6.6.89 官方OKI源码
-            - **包含补丁**: HymoFS (Pure, No SUSFS, No KSU)
-            - **Root权限**: 无 (Stock Kernel behavior with HymoFS support)
-            
-            ### ℹ️ 说明
-            这是一个用于测试 HymoFS 功能的纯净内核构建，未包含 KernelSU、SUSFS 或其他性能优化补丁。
+            ### 🚀 HymoFS 内核构建 | Build Info
+            - **版本号**: ${{ env.FULL_VERSION }}
+            - **内核版本**: ${{ env.KERNEL_VERSION }}.89-${{ env.KERNEL_BUILD_SUFFIX }}
+            - **编译时间**: ${{ env.TIME_FORM }}
+            - **内核源码**：OnePlus Ace 5 Ultra 6.6.89 官方OKI源码
+            - **包含补丁**: HymoFS (Pure)
             
             ### 📋 补丁信息
             - Source: `https://raw.githubusercontent.com/Anatdx/HymoFS/refs/heads/main/patch/hymofs.patch`
             - Config: `CONFIG_HYMOFS=y`
             
-            ### ⚠️ 警告
-            仅供测试使用，请确保备份 `boot.img`。
+            ### ⚠️ 注意
+            此版本为纯净 HymoFS 支持内核，不包含任何 Root 方案（如 KernelSU），请根据需要自行刷入 Root 模块。
           draft: false
-          prerelease: true
+          prerelease: false
           files: |
             release_zips/AnyKernel3_*.zip
+
